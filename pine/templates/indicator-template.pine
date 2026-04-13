@@ -1,0 +1,5 @@
+//@version=6
+indicator("New Indicator", overlay=true)
+
+// Replace this template with the actual logic for the indicator.
+plot(close, title="Close")

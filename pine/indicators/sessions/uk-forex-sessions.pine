@@ -1,0 +1,215 @@
+//@version=6
+indicator("UK Forex Sessions - London / New York / Japan", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// Session definitions use the local market time zone for each session and display
+// all annotations in UK time.
+displayGroup = "Display"
+sessionGroup = "Session Times"
+sessionColorGroup = "Session Colors"
+overlapColorGroup = "Overlap Colors"
+styleGroup = "Label / Line Styling"
+
+displayTimezone = input.string("Europe/London", "Display timezone", group=displayGroup)
+showBackground = input.bool(true, "Highlight sessions and overlaps", group=displayGroup)
+sessionsToKeep = input.int(20, "Session drawings to keep", minval=1, maxval=100, group=displayGroup)
+showLabels = input.bool(true, "Show open/close labels", group=styleGroup)
+showPriceLines = input.bool(true, "Show open/close price lines", group=styleGroup)
+showOpenPrice = input.bool(true, "Show open price", group=styleGroup)
+showClosePrice = input.bool(true, "Show close price", group=styleGroup)
+labelSizeChoice = input.string("Small", "Label text size", options=["Small", "Normal", "Large"], group=styleGroup)
+showSessionColors = input.bool(true, "Use custom session colors", group=sessionColorGroup)
+
+londonColorInput = input.color(color.rgb(0, 170, 255), "London session color", group=sessionColorGroup)
+newYorkColorInput = input.color(color.rgb(255, 140, 0), "New York session color", group=sessionColorGroup)
+tokyoColorInput = input.color(color.rgb(0, 200, 120), "Japan session color", group=sessionColorGroup)
+londonNewYorkOverlapColor = input.color(color.purple, "London / New York overlap color", group=overlapColorGroup)
+londonTokyoOverlapColor = input.color(color.teal, "London / Japan overlap color", group=overlapColorGroup)
+newYorkTokyoOverlapColor = input.color(color.orange, "New York / Japan overlap color", group=overlapColorGroup)
+
+londonSession = input.session("0800-1700", "London session", group=sessionGroup)
+londonTimezone = input.string("Europe/London", "London timezone", group=sessionGroup)
+
+newYorkSession = input.session("0800-1700", "New York session", group=sessionGroup)
+newYorkTimezone = input.string("America/New_York", "New York timezone", group=sessionGroup)
+
+tokyoSession = input.session("0900-1800", "Tokyo session", group=sessionGroup)
+tokyoTimezone = input.string("Asia/Tokyo", "Tokyo timezone", group=sessionGroup)
+
+londonColor = showSessionColors ? londonColorInput : color.rgb(0, 170, 255)
+newYorkColor = showSessionColors ? newYorkColorInput : color.rgb(255, 140, 0)
+tokyoColor = showSessionColors ? tokyoColorInput : color.rgb(0, 200, 120)
+
+var line[] londonOpenLines = array.new_line()
+var line[] londonCloseLines = array.new_line()
+var label[] londonOpenLabels = array.new_label()
+var label[] londonCloseLabels = array.new_label()
+var int londonStartBar = na
+var int londonStartTime = na
+var float londonOpenPrice = na
+
+var line[] newYorkOpenLines = array.new_line()
+var line[] newYorkCloseLines = array.new_line()
+var label[] newYorkOpenLabels = array.new_label()
+var label[] newYorkCloseLabels = array.new_label()
+var int newYorkStartBar = na
+var int newYorkStartTime = na
+var float newYorkOpenPrice = na
+
+var line[] tokyoOpenLines = array.new_line()
+var line[] tokyoCloseLines = array.new_line()
+var label[] tokyoOpenLabels = array.new_label()
+var label[] tokyoCloseLabels = array.new_label()
+var int tokyoStartBar = na
+var int tokyoStartTime = na
+var float tokyoOpenPrice = na
+
+f_pad2(value) =>
+    value < 10 ? "0" + str.tostring(value) : str.tostring(value)
+
+f_time_text(ts, tz) =>
+    f_pad2(hour(ts, tz)) + ":" + f_pad2(minute(ts, tz))
+
+f_price_text(price) =>
+    str.tostring(price, format.mintick)
+
+f_session_active(sessionStr, tz) =>
+    not na(time(timeframe.period, sessionStr, tz))
+
+f_label_size(choice) =>
+    switch choice
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+sessionLabelSize = f_label_size(labelSizeChoice)
+
+londonActive = f_session_active(londonSession, londonTimezone)
+newYorkActive = f_session_active(newYorkSession, newYorkTimezone)
+tokyoActive = f_session_active(tokyoSession, tokyoTimezone)
+
+londonPrevActive = londonActive[1]
+newYorkPrevActive = newYorkActive[1]
+tokyoPrevActive = tokyoActive[1]
+
+londonStart = londonActive and not londonPrevActive
+londonEnd = not londonActive and londonPrevActive
+newYorkStart = newYorkActive and not newYorkPrevActive
+newYorkEnd = not newYorkActive and newYorkPrevActive
+tokyoStart = tokyoActive and not tokyoPrevActive
+tokyoEnd = not tokyoActive and tokyoPrevActive
+
+if londonStart
+    londonStartBar := bar_index
+    londonStartTime := time
+    londonOpenPrice := open
+
+if newYorkStart
+    newYorkStartBar := bar_index
+    newYorkStartTime := time
+    newYorkOpenPrice := open
+
+if tokyoStart
+    tokyoStartBar := bar_index
+    tokyoStartTime := time
+    tokyoOpenPrice := open
+
+if londonEnd and not na(londonStartBar) and not na(londonOpenPrice)
+    londonEndBar = bar_index[1]
+    londonClosePrice = close[1]
+    londonOpenTime = f_time_text(londonStartTime, displayTimezone)
+    londonCloseTime = f_time_text(time_close[1], displayTimezone)
+    if showPriceLines and showOpenPrice
+        openLine = line.new(londonStartBar, londonOpenPrice, londonEndBar, londonOpenPrice, xloc=xloc.bar_index, color=londonColor, width=2)
+        array.push(londonOpenLines, openLine)
+        if array.size(londonOpenLines) > sessionsToKeep
+            line.delete(array.shift(londonOpenLines))
+    if showPriceLines and showClosePrice
+        closeLine = line.new(londonStartBar, londonClosePrice, londonEndBar, londonClosePrice, xloc=xloc.bar_index, color=color.new(londonColor, 35), width=2, style=line.style_dashed)
+        array.push(londonCloseLines, closeLine)
+        if array.size(londonCloseLines) > sessionsToKeep
+            line.delete(array.shift(londonCloseLines))
+    if showLabels
+        openLabel = label.new(londonStartBar, londonOpenPrice, "London Open\n" + londonOpenTime + " UK\n" + f_price_text(londonOpenPrice), xloc=xloc.bar_index, style=label.style_label_up, color=londonColor, textcolor=color.white, size=sessionLabelSize)
+        closeLabel = label.new(londonEndBar, londonClosePrice, "London Close\n" + londonCloseTime + " UK\n" + f_price_text(londonClosePrice), xloc=xloc.bar_index, style=label.style_label_down, color=color.new(londonColor, 15), textcolor=color.white, size=sessionLabelSize)
+        array.push(londonOpenLabels, openLabel)
+        array.push(londonCloseLabels, closeLabel)
+        if array.size(londonOpenLabels) > sessionsToKeep
+            label.delete(array.shift(londonOpenLabels))
+        if array.size(londonCloseLabels) > sessionsToKeep
+            label.delete(array.shift(londonCloseLabels))
+    londonStartBar := na
+    londonStartTime := na
+    londonOpenPrice := na
+
+if newYorkEnd and not na(newYorkStartBar) and not na(newYorkOpenPrice)
+    newYorkEndBar = bar_index[1]
+    newYorkClosePrice = close[1]
+    newYorkOpenTime = f_time_text(newYorkStartTime, displayTimezone)
+    newYorkCloseTime = f_time_text(time_close[1], displayTimezone)
+    if showPriceLines and showOpenPrice
+        openLine = line.new(newYorkStartBar, newYorkOpenPrice, newYorkEndBar, newYorkOpenPrice, xloc=xloc.bar_index, color=newYorkColor, width=2)
+        array.push(newYorkOpenLines, openLine)
+        if array.size(newYorkOpenLines) > sessionsToKeep
+            line.delete(array.shift(newYorkOpenLines))
+    if showPriceLines and showClosePrice
+        closeLine = line.new(newYorkStartBar, newYorkClosePrice, newYorkEndBar, newYorkClosePrice, xloc=xloc.bar_index, color=color.new(newYorkColor, 35), width=2, style=line.style_dashed)
+        array.push(newYorkCloseLines, closeLine)
+        if array.size(newYorkCloseLines) > sessionsToKeep
+            line.delete(array.shift(newYorkCloseLines))
+    if showLabels
+        openLabel = label.new(newYorkStartBar, newYorkOpenPrice, "New York Open\n" + newYorkOpenTime + " UK\n" + f_price_text(newYorkOpenPrice), xloc=xloc.bar_index, style=label.style_label_up, color=newYorkColor, textcolor=color.white, size=sessionLabelSize)
+        closeLabel = label.new(newYorkEndBar, newYorkClosePrice, "New York Close\n" + newYorkCloseTime + " UK\n" + f_price_text(newYorkClosePrice), xloc=xloc.bar_index, style=label.style_label_down, color=color.new(newYorkColor, 15), textcolor=color.white, size=sessionLabelSize)
+        array.push(newYorkOpenLabels, openLabel)
+        array.push(newYorkCloseLabels, closeLabel)
+        if array.size(newYorkOpenLabels) > sessionsToKeep
+            label.delete(array.shift(newYorkOpenLabels))
+        if array.size(newYorkCloseLabels) > sessionsToKeep
+            label.delete(array.shift(newYorkCloseLabels))
+    newYorkStartBar := na
+    newYorkStartTime := na
+    newYorkOpenPrice := na
+
+if tokyoEnd and not na(tokyoStartBar) and not na(tokyoOpenPrice)
+    tokyoEndBar = bar_index[1]
+    tokyoClosePrice = close[1]
+    tokyoOpenTime = f_time_text(tokyoStartTime, displayTimezone)
+    tokyoCloseTime = f_time_text(time_close[1], displayTimezone)
+    if showPriceLines and showOpenPrice
+        openLine = line.new(tokyoStartBar, tokyoOpenPrice, tokyoEndBar, tokyoOpenPrice, xloc=xloc.bar_index, color=tokyoColor, width=2)
+        array.push(tokyoOpenLines, openLine)
+        if array.size(tokyoOpenLines) > sessionsToKeep
+            line.delete(array.shift(tokyoOpenLines))
+    if showPriceLines and showClosePrice
+        closeLine = line.new(tokyoStartBar, tokyoClosePrice, tokyoEndBar, tokyoClosePrice, xloc=xloc.bar_index, color=color.new(tokyoColor, 35), width=2, style=line.style_dashed)
+        array.push(tokyoCloseLines, closeLine)
+        if array.size(tokyoCloseLines) > sessionsToKeep
+            line.delete(array.shift(tokyoCloseLines))
+    if showLabels
+        openLabel = label.new(tokyoStartBar, tokyoOpenPrice, "Japan Open\n" + tokyoOpenTime + " UK\n" + f_price_text(tokyoOpenPrice), xloc=xloc.bar_index, style=label.style_label_up, color=tokyoColor, textcolor=color.white, size=sessionLabelSize)
+        closeLabel = label.new(tokyoEndBar, tokyoClosePrice, "Japan Close\n" + tokyoCloseTime + " UK\n" + f_price_text(tokyoClosePrice), xloc=xloc.bar_index, style=label.style_label_down, color=color.new(tokyoColor, 15), textcolor=color.white, size=sessionLabelSize)
+        array.push(tokyoOpenLabels, openLabel)
+        array.push(tokyoCloseLabels, closeLabel)
+        if array.size(tokyoOpenLabels) > sessionsToKeep
+            label.delete(array.shift(tokyoOpenLabels))
+        if array.size(tokyoCloseLabels) > sessionsToKeep
+            label.delete(array.shift(tokyoCloseLabels))
+    tokyoStartBar := na
+    tokyoStartTime := na
+    tokyoOpenPrice := na
+
+color bg = na
+if showBackground
+    if londonActive and newYorkActive
+        bg := color.new(londonNewYorkOverlapColor, 86)
+    else if londonActive and tokyoActive
+        bg := color.new(londonTokyoOverlapColor, 88)
+    else if newYorkActive and tokyoActive
+        bg := color.new(newYorkTokyoOverlapColor, 88)
+    else if londonActive
+        bg := color.new(londonColor, 92)
+    else if newYorkActive
+        bg := color.new(newYorkColor, 92)
+    else if tokyoActive
+        bg := color.new(tokyoColor, 92)
+
+bgcolor(bg)
