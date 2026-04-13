@@ -1,0 +1,456 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © holofoundry
+
+//@version=6
+strategy("FX Structure + Liquidity Retracement Strategy", overlay=true, pyramiding=0, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.01)
+
+// =====================
+// Inputs
+// =====================
+mainSwingLen         = input.int(5, "Main Structure Swing Length", minval=2)
+internalSwingLen     = input.int(2, "State Machine Swing Length", minval=1)
+
+liqLookback          = input.int(15, "Liquidity Lookback", minval=3)
+equalThreshPct       = input.float(0.03, "Equal High/Low Threshold %", step=0.01)
+
+poiBufferPct         = input.float(0.15, "POI Zone Buffer %", step=0.01)
+forwardPoiBars       = input.int(80, "Forward POI Life (bars)", minval=5)
+entryRetraceBars     = input.int(20, "Bars Allowed For Retrace Entry", minval=1)
+patternResetBars     = input.int(20, "Reset State Machine After X Bars", minval=3)
+
+confirmCloses        = input.int(2, "Body Closes Needed To Confirm New Range", minval=2, maxval=3)
+
+rr                   = input.float(2.0, "Risk Reward", step=0.1)
+useAtrStop           = input.bool(false, "Use ATR Stop")
+atrLen               = input.int(14, "ATR Length", minval=1)
+atrMult              = input.float(1.5, "ATR Multiplier", step=0.1)
+stopBufferPips       = input.float(3.0, "Stop Buffer Pips", step=0.1)
+
+useSessionFilter     = input.bool(true, "Use Session Filter")
+tradeSession         = input.session("0700-1700", "Trading Session")
+allow4HOutsideHours  = input.bool(true, "Allow Outside Session On 4H")
+
+showDebugPlots       = input.bool(true, "Show Debug Plots")
+showStateLabels      = input.bool(true, "Show State Labels")
+showForwardPois      = input.bool(true, "Show Forward POIs")
+
+// =====================
+// Helpers
+// =====================
+pip = syminfo.mintick * 10.0
+stopBuffer = stopBufferPips * pip
+atr = ta.atr(atrLen)
+
+pctDiff(a, b) =>
+    b != 0 ? math.abs(a - b) / math.abs(b) * 100.0 : 0.0
+
+zoneLow(center, bufferPct) =>
+    center * (1 - bufferPct / 100.0)
+
+zoneHigh(center, bufferPct) =>
+    center * (1 + bufferPct / 100.0)
+
+inZone(price, center, bufferPct) =>
+    not na(center) and price >= zoneLow(center, bufferPct) and price <= zoneHigh(center, bufferPct)
+
+barTouchesZone(barLow, barHigh, center, bufferPct) =>
+    not na(center) and barHigh >= zoneLow(center, bufferPct) and barLow <= zoneHigh(center, bufferPct)
+
+bodyCloseBelow(level) =>
+    close < level and open < level
+
+bodyCloseAbove(level) =>
+    close > level and open > level
+
+is4H = timeframe.period == "240"
+inSession = not na(time(timeframe.period, tradeSession))
+sessionAllowed = useSessionFilter ? (inSession or (allow4HOutsideHours and is4H)) : true
+
+// =====================
+// Main structure pivots
+// =====================
+ph = ta.pivothigh(high, mainSwingLen, mainSwingLen)
+pl = ta.pivotlow(low, mainSwingLen, mainSwingLen)
+
+var float mainHigh1 = na
+var float mainHigh2 = na
+var float mainLow1  = na
+var float mainLow2  = na
+
+if not na(ph)
+    mainHigh2 := mainHigh1
+    mainHigh1 := ph
+
+if not na(pl)
+    mainLow2 := mainLow1
+    mainLow1 := pl
+
+bullStructure = not na(mainHigh1) and not na(mainHigh2) and not na(mainLow1) and not na(mainLow2) and mainHigh1 > mainHigh2 and mainLow1 > mainLow2
+bearStructure = not na(mainHigh1) and not na(mainHigh2) and not na(mainLow1) and not na(mainLow2) and mainHigh1 < mainHigh2 and mainLow1 < mainLow2
+
+// =====================
+// Internal correction pivots
+// HL in bullish structure, LH in bearish structure
+// =====================
+iph = ta.pivothigh(high, internalSwingLen, internalSwingLen)
+ipl = ta.pivotlow(low, internalSwingLen, internalSwingLen)
+
+var float intHigh1 = na
+var float intHigh2 = na
+var float intLow1  = na
+var float intLow2  = na
+
+if not na(iph)
+    intHigh2 := intHigh1
+    intHigh1 := iph
+
+if not na(ipl)
+    intLow2 := intLow1
+    intLow1 := ipl
+
+currentBullPoi = bullStructure ? intLow1 : na
+currentBearPoi = bearStructure ? intHigh1 : na
+
+// =====================
+// Forward continuation POIs
+// Persist last confirmed HL/LH into future
+// =====================
+var float fwdBullPoi = na
+var int   fwdBullPoiBar = na
+
+var float fwdBearPoi = na
+var int   fwdBearPoiBar = na
+
+if bullStructure and not na(currentBullPoi)
+    fwdBullPoi := currentBullPoi
+    fwdBullPoiBar := bar_index
+
+if bearStructure and not na(currentBearPoi)
+    fwdBearPoi := currentBearPoi
+    fwdBearPoiBar := bar_index
+
+fwdBullPoiActive = not na(fwdBullPoi) and not na(fwdBullPoiBar) and (bar_index - fwdBullPoiBar <= forwardPoiBars)
+fwdBearPoiActive = not na(fwdBearPoi) and not na(fwdBearPoiBar) and (bar_index - fwdBearPoiBar <= forwardPoiBars)
+
+// Invalidate continuation POIs when opposite structure takes over
+if bearStructure
+    fwdBullPoi := na
+    fwdBullPoiBar := na
+
+if bullStructure
+    fwdBearPoi := na
+    fwdBearPoiBar := na
+
+// =====================
+// Liquidity near forward continuation POIs
+// =====================
+var int eqLowCount = 0
+var int eqHighCount = 0
+
+eqLowCount := 0
+eqHighCount := 0
+
+for i = 1 to liqLookback
+    if fwdBullPoiActive and inZone(low[i], fwdBullPoi, poiBufferPct) and pctDiff(low[i], fwdBullPoi) <= equalThreshPct
+        eqLowCount += 1
+    if fwdBearPoiActive and inZone(high[i], fwdBearPoi, poiBufferPct) and pctDiff(high[i], fwdBearPoi) <= equalThreshPct
+        eqHighCount += 1
+
+sellSideLiquidityAtBullPoi = eqLowCount >= 2
+buySideLiquidityAtBearPoi  = eqHighCount >= 2
+
+// =====================
+// Sweep logic at forward continuation POIs
+// =====================
+bullSweep = fwdBullPoiActive and sellSideLiquidityAtBullPoi and low < fwdBullPoi and close > fwdBullPoi
+bearSweep = fwdBearPoiActive and buySideLiquidityAtBearPoi and high > fwdBearPoi and close < fwdBearPoi
+
+var int bullSweepBar = na
+var int bearSweepBar = na
+
+if bullSweep
+    bullSweepBar := bar_index
+
+if bearSweep
+    bearSweepBar := bar_index
+
+// =====================
+// New range confirmation
+// =====================
+var float bearBreakLevel = na
+var float bullBreakLevel = na
+
+if bullStructure and not na(mainLow1)
+    bearBreakLevel := mainLow1
+
+if bearStructure and not na(mainHigh1)
+    bullBreakLevel := mainHigh1
+
+below1 = not na(bearBreakLevel) and bodyCloseBelow(bearBreakLevel)
+below2 = not na(bearBreakLevel) and bodyCloseBelow(bearBreakLevel)[1]
+above1 = not na(bullBreakLevel) and bodyCloseAbove(bullBreakLevel)
+above2 = not na(bullBreakLevel) and bodyCloseAbove(bullBreakLevel)[1]
+
+twoBodyClosesBelow = confirmCloses == 2 ? (below1 and below2) : (below1 and below2 and bodyCloseBelow(bearBreakLevel)[2])
+twoBodyClosesAbove = confirmCloses == 2 ? (above1 and above2) : (above1 and above2 and bodyCloseAbove(bullBreakLevel)[2])
+
+bearRangeConfirmed = bullStructure[1] and twoBodyClosesBelow
+bullRangeConfirmed = bearStructure[1] and twoBodyClosesAbove
+
+var int bearRangeConfirmBar = na
+var int bullRangeConfirmBar = na
+
+if bearRangeConfirmed
+    bearRangeConfirmBar := bar_index
+
+if bullRangeConfirmed
+    bullRangeConfirmBar := bar_index
+
+// =====================
+// Forward reversal POIs
+// Persist break origin / retracement level into future
+// =====================
+var float fwdBearReversalPoi = na
+var int   fwdBearReversalPoiBar = na
+
+var float fwdBullReversalPoi = na
+var int   fwdBullReversalPoiBar = na
+
+if bearRangeConfirmed and not na(bearBreakLevel)
+    fwdBearReversalPoi := bearBreakLevel
+    fwdBearReversalPoiBar := bar_index
+
+if bullRangeConfirmed and not na(bullBreakLevel)
+    fwdBullReversalPoi := bullBreakLevel
+    fwdBullReversalPoiBar := bar_index
+
+fwdBearReversalPoiActive = not na(fwdBearReversalPoi) and not na(fwdBearReversalPoiBar) and (bar_index - fwdBearReversalPoiBar <= entryRetraceBars)
+fwdBullReversalPoiActive = not na(fwdBullReversalPoi) and not na(fwdBullReversalPoiBar) and (bar_index - fwdBullReversalPoiBar <= entryRetraceBars)
+
+// Retrace into the projected reversal POI
+bearRetraceTouched = fwdBearReversalPoiActive and barTouchesZone(low, high, fwdBearReversalPoi, poiBufferPct)
+bullRetraceTouched = fwdBullReversalPoiActive and barTouchesZone(low, high, fwdBullReversalPoi, poiBufferPct)
+
+// =====================
+// State machine pivots
+// Buy sequence: low -> high -> HL -> HH
+// Sell sequence: high -> low -> LH -> LL
+// =====================
+statePH = ta.pivothigh(high, internalSwingLen, internalSwingLen)
+statePL = ta.pivotlow(low, internalSwingLen, internalSwingLen)
+
+newStateHigh = not na(statePH)
+newStateLow  = not na(statePL)
+
+var int bullState = 0
+var int bearState = 0
+
+var float bullSeqLow1 = na
+var float bullSeqHigh1 = na
+var float bullSeqHL = na
+
+var float bearSeqHigh1 = na
+var float bearSeqLow1 = na
+var float bearSeqLH = na
+
+var int bullStateStartBar = na
+var int bearStateStartBar = na
+
+// =====================
+// Triggers
+// =====================
+bullContinuationTrigger = bullSweep
+bearContinuationTrigger = bearSweep
+
+bullReversalTrigger = bullRetraceTouched
+bearReversalTrigger = bearRetraceTouched
+
+bullTrigger = bullContinuationTrigger or bullReversalTrigger
+bearTrigger = bearContinuationTrigger or bearReversalTrigger
+
+// Reset on timeout
+if bullState > 0 and not na(bullStateStartBar) and (bar_index - bullStateStartBar > patternResetBars)
+    bullState := 0
+    bullSeqLow1 := na
+    bullSeqHigh1 := na
+    bullSeqHL := na
+    bullStateStartBar := na
+
+if bearState > 0 and not na(bearStateStartBar) and (bar_index - bearStateStartBar > patternResetBars)
+    bearState := 0
+    bearSeqHigh1 := na
+    bearSeqLow1 := na
+    bearSeqLH := na
+    bearStateStartBar := na
+
+// Reset opposite state when one side triggers
+if bullTrigger
+    bearState := 0
+    bearSeqHigh1 := na
+    bearSeqLow1 := na
+    bearSeqLH := na
+    bearStateStartBar := na
+
+if bearTrigger
+    bullState := 0
+    bullSeqLow1 := na
+    bullSeqHigh1 := na
+    bullSeqHL := na
+    bullStateStartBar := na
+
+// Start bullish sequence
+if bullTrigger and bullState == 0
+    bullState := 1
+    bullStateStartBar := bar_index
+    bullSeqLow1 := na
+    bullSeqHigh1 := na
+    bullSeqHL := na
+
+// Start bearish sequence
+if bearTrigger and bearState == 0
+    bearState := 1
+    bearStateStartBar := bar_index
+    bearSeqHigh1 := na
+    bearSeqLow1 := na
+    bearSeqLH := na
+
+// Bullish state machine
+if bullState == 1 and newStateLow
+    bullSeqLow1 := statePL
+    bullState := 2
+
+if bullState == 2 and newStateHigh and not na(bullSeqLow1) and statePH > bullSeqLow1
+    bullSeqHigh1 := statePH
+    bullState := 3
+
+if bullState == 3 and newStateLow and not na(bullSeqLow1) and not na(bullSeqHigh1) and statePL > bullSeqLow1 and statePL < bullSeqHigh1
+    bullSeqHL := statePL
+    bullState := 4
+
+bullPatternConfirmed = bullState == 4 and newStateHigh and not na(bullSeqHigh1) and not na(bullSeqHL) and statePH > bullSeqHigh1
+
+if bullPatternConfirmed
+    bullState := 0
+    bullSeqLow1 := na
+    bullSeqHigh1 := na
+    bullSeqHL := na
+    bullStateStartBar := na
+
+// Bearish state machine
+if bearState == 1 and newStateHigh
+    bearSeqHigh1 := statePH
+    bearState := 2
+
+if bearState == 2 and newStateLow and not na(bearSeqHigh1) and statePL < bearSeqHigh1
+    bearSeqLow1 := statePL
+    bearState := 3
+
+if bearState == 3 and newStateHigh and not na(bearSeqHigh1) and not na(bearSeqLow1) and statePH < bearSeqHigh1 and statePH > bearSeqLow1
+    bearSeqLH := statePH
+    bearState := 4
+
+bearPatternConfirmed = bearState == 4 and newStateLow and not na(bearSeqLow1) and not na(bearSeqLH) and statePL < bearSeqLow1
+
+if bearPatternConfirmed
+    bearState := 0
+    bearSeqHigh1 := na
+    bearSeqLow1 := na
+    bearSeqLH := na
+    bearStateStartBar := na
+
+// =====================
+// Final setup logic
+// =====================
+bullContinuationReady = bullStructure and not na(bullSweepBar) and bullPatternConfirmed
+bearContinuationReady = bearStructure and not na(bearSweepBar) and bearPatternConfirmed
+
+bullReversalReady = fwdBullReversalPoiActive and bullReversalTrigger and bullPatternConfirmed
+bearReversalReady = fwdBearReversalPoiActive and bearReversalTrigger and bearPatternConfirmed
+
+longSignal = sessionAllowed and (bullContinuationReady or bullReversalReady)
+shortSignal = sessionAllowed and (bearContinuationReady or bearReversalReady)
+
+// =====================
+// Stops and targets
+// =====================
+float longStopRef = fwdBullPoiActive ? fwdBullPoi : low
+float shortStopRef = fwdBearPoiActive ? fwdBearPoi : high
+
+if bullReversalReady and not na(fwdBullReversalPoi)
+    longStopRef := fwdBullReversalPoi
+
+if bearReversalReady and not na(fwdBearReversalPoi)
+    shortStopRef := fwdBearReversalPoi
+
+longSwingStop = longStopRef - stopBuffer
+shortSwingStop = shortStopRef + stopBuffer
+
+longAtrStop = close - atr * atrMult
+shortAtrStop = close + atr * atrMult
+
+longStop = useAtrStop ? longAtrStop : longSwingStop
+shortStop = useAtrStop ? shortAtrStop : shortSwingStop
+
+longRisk = close - longStop
+shortRisk = shortStop - close
+
+longTarget = close + longRisk * rr
+shortTarget = close - shortRisk * rr
+
+// =====================
+// Orders
+// =====================
+if longSignal and strategy.position_size <= 0 and longRisk > 0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=longStop, limit=longTarget)
+
+if shortSignal and strategy.position_size >= 0 and shortRisk > 0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortTarget)
+
+// =====================
+// Visuals
+// =====================
+plot(showDebugPlots ? currentBullPoi : na, "Current Bull POI", color=color.new(color.green, 70), linewidth=1)
+plot(showDebugPlots ? currentBearPoi : na, "Current Bear POI", color=color.new(color.red, 70), linewidth=1)
+
+plot(showForwardPois and fwdBullPoiActive ? fwdBullPoi : na, "Forward Bull Continuation POI", color=color.new(color.green, 0), linewidth=2, style=plot.style_linebr)
+plot(showForwardPois and fwdBearPoiActive ? fwdBearPoi : na, "Forward Bear Continuation POI", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+
+plot(showForwardPois and fwdBullReversalPoiActive ? fwdBullReversalPoi : na, "Forward Bull Reversal POI", color=color.new(color.teal, 0), linewidth=2, style=plot.style_linebr)
+plot(showForwardPois and fwdBearReversalPoiActive ? fwdBearReversalPoi : na, "Forward Bear Reversal POI", color=color.new(color.maroon, 0), linewidth=2, style=plot.style_linebr)
+
+plotshape(showDebugPlots and bullSweep, title="Bull Sweep", style=shape.circle, location=location.belowbar, color=color.green, size=size.tiny, text="Sweep")
+plotshape(showDebugPlots and bearSweep, title="Bear Sweep", style=shape.circle, location=location.abovebar, color=color.red, size=size.tiny, text="Sweep")
+
+plotshape(longSignal, title="Long Signal", style=shape.labelup, location=location.belowbar, color=color.lime, text="LONG")
+plotshape(shortSignal, title="Short Signal", style=shape.labeldown, location=location.abovebar, color=color.red, text="SHORT")
+
+bgcolor(showDebugPlots ? bullStructure ? color.new(color.green, 92) : bearStructure ? color.new(color.red, 92) : na : na)
+
+plotchar(showDebugPlots ? bullState : na, title="Bull State", char="B", location=location.bottom, color=color.green, size=size.tiny)
+plotchar(showDebugPlots ? bearState : na, title="Bear State", char="S", location=location.bottom, color=color.red, size=size.tiny)
+
+if showStateLabels and bullContinuationTrigger
+    label.new(bar_index, low, "Bull cont trigger", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+
+if showStateLabels and bearContinuationTrigger
+    label.new(bar_index, high, "Bear cont trigger", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+if showStateLabels and bullReversalTrigger
+    label.new(bar_index, low, "Bull rev trigger", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+
+if showStateLabels and bearReversalTrigger
+    label.new(bar_index, high, "Bear rev trigger", style=label.style_label_down, color=color.new(color.maroon, 0), textcolor=color.white)
+
+if showStateLabels and bullPatternConfirmed
+    label.new(bar_index, low, "Bull seq done", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+
+if showStateLabels and bearPatternConfirmed
+    label.new(bar_index, high, "Bear seq done", style=label.style_label_down, color=color.new(color.maroon, 0), textcolor=color.white)
+
+if longSignal
+    alert("Long setup detected", alert.freq_once_per_bar_close)
+
+if shortSignal
+    alert("Short setup detected", alert.freq_once_per_bar_close)
